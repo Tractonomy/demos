@@ -307,7 +307,8 @@ class TopicMonitorDisplay:
                 line.set_alpha(0.5 if monitored_topic.status == 'Stale' else 1.0)
                 
                 y_data = monitored_topic.reception_latency_over_time
-                max_latency = max(max_latency, max(filter(None.__ne__, y_data)))
+                if len(list(filter(None.__ne__, y_data))) > 0:
+                    max_latency = max(max_latency, max(filter(None.__ne__, y_data)))
                 line = self.reception_rate_plots[topic_name + "_latency"]
                 line.set_ydata(y_data)
                 line.set_xdata(self.x_data[-len(y_data):])
