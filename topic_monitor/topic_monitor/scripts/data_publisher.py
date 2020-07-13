@@ -100,6 +100,7 @@ def main():
 
     def publish_msg(val):
         msg.frame_id = '{0}_{1}'.format(val, data)
+        msg.stamp = node.get_clock().now().to_msg()
         data_pub.publish(msg)
         node_logger.info('Publishing: "{0}"'.format(val))
 

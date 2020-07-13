@@ -17,11 +17,13 @@ import functools
 import re
 from threading import Lock, Thread
 import time
+from collections import deque
 
 import rclpy
 import rclpy.logging
 from rclpy.qos import QoSProfile
 from rclpy.qos import QoSReliabilityPolicy
+from rclpy.time import Time
 
 from std_msgs.msg import Float32, Header
 
@@ -32,13 +34,15 @@ logger = rclpy.logging.get_logger('topic_monitor')
 class MonitoredTopic:
     """Monitor for the statistics and status of a single topic."""
 
-    def __init__(self, topic_id, stale_time, lock=None):
+    def __init__(self, topic_id, stale_time, lock=None, window_size=QOS_DEPTH):
         self.expected_value = None
         self.expected_value_timer = None
         self.initial_value = None
         self.lock = lock or Lock()
-        self.received_values = []
+        self.received_values = deque(maxlen=window_size)
+        self.received_latencies = deque(maxlen=window_size)
         self.reception_rate_over_time = []
+        self.reception_latency_over_time = []
         self.stale_time = stale_time
         self.status = 'Offline'
         self.status_changed = False
@@ -55,13 +59,15 @@ class MonitoredTopic:
         self.expected_value_timer.reset()
 
     def get_data_from_msg(self, msg):
+        timestamp = Time.from_msg(msg.stamp)
         data = msg.frame_id
         idx = data.find('_')
         data = data[:idx] if idx != -1 else data
-        return int(data) if data else 0
+        return (int(data) if data else 0, timestamp)
 
-    def topic_data_callback(self, msg, logger_=logger):
-        received_value = self.get_data_from_msg(msg)
+    def topic_data_callback(self, msg, node_=None, logger_=logger):
+        current_timestamp = node_.get_clock().now()
+        received_value, timestamp = self.get_data_from_msg(msg)
         logger_.info('%s: %s' % (self.topic_id, str(received_value)))
         status = 'Alive'
         with self.lock:
@@ -78,6 +84,7 @@ class MonitoredTopic:
             else:
                 self.expected_value_timer.cancel()
                 self.received_values.append(received_value)
+                self.received_latencies.append((current_timestamp - timestamp).nanoseconds)
                 self.expected_value = received_value + 1
                 self.allowed_latency_timer.reset()
             self.time_of_last_data = time.time()  # TODO(dhood): time stamp of msg
@@ -101,14 +108,19 @@ class MonitoredTopic:
 
     def current_reception_rate(self, window_size):
         rate = None
+        latency = None
         if self.status != 'Offline':
             expected_values = range(
                 max(self.initial_value, self.expected_value - window_size),
                 self.expected_value)
-            # How many of the expected values have been received?
-            count = len(set(expected_values) & set(self.received_values))
-            rate = count / len(expected_values)
-        return rate
+            try:
+                # How many of the expected values have been received?
+                count = len(set(expected_values) & set(self.received_values))
+                rate = count / len(expected_values)
+                latency = sum(self.received_latencies) / len(self.received_latencies) / 1e6
+            except ZeroDivisionError:
+                pass
+        return rate, latency
 
 
 class TopicMonitor:
@@ -127,14 +139,14 @@ class TopicMonitor:
             self, topic_type, topic_name, node, qos_profile,
             expected_period=1.0, allowed_latency=1.0, stale_time=1.0):
         # Create a subscription to the topic
-        monitored_topic = MonitoredTopic(topic_name, stale_time, lock=self.monitored_topics_lock)
+        monitored_topic = MonitoredTopic(topic_name, stale_time, lock=self.monitored_topics_lock, window_size=self.window_size)
         monitored_topic.topic_name = topic_name
         node_logger = node.get_logger()
         node_logger.info('Subscribing to topic: %s' % topic_name)
         sub = node.create_subscription(
             topic_type,
             topic_name,
-            functools.partial(monitored_topic.topic_data_callback, logger_=node_logger),
+            functools.partial(monitored_topic.topic_data_callback, node_=node, logger_=node_logger),
             qos_profile)
         assert sub  # prevent unused warning
 
@@ -215,8 +227,9 @@ class TopicMonitor:
     def calculate_reception_rates(self):
         with self.monitored_topics_lock:
             for topic_id, monitored_topic in self.monitored_topics.items():
-                rate = monitored_topic.current_reception_rate(self.window_size)
+                rate, latency = monitored_topic.current_reception_rate(self.window_size)
                 monitored_topic.reception_rate_over_time.append(rate)
+                monitored_topic.reception_latency_over_time.append(latency)
                 rateMsg = Float32()
                 rateMsg.data = rate if rate is not None else 0.0
                 self.publishers[topic_id].publish(rateMsg)
@@ -249,6 +262,10 @@ class TopicMonitorDisplay:
         plt.ylabel('Reception rate (last %i msgs)' % self.topic_monitor.get_window_size())
         self.ax = self.fig.add_subplot(111)
         self.ax.axis([0, self.x_range_s, 0, 1.1])
+        self.par1 = self.ax.twinx()
+        self.par1.set_ylabel('Reception latency (last %i msgs) (ms)' % self.topic_monitor.get_window_size())
+        self.par1.axis([0, self.x_range_s, 0, 1000])
+
 
         # Shrink axis' height to make room for legend
         shrink_amnt = 0.2
@@ -256,15 +273,15 @@ class TopicMonitorDisplay:
         self.ax.set_position(
             [box.x0, box.y0 + box.height * shrink_amnt, box.width, box.height * (1 - shrink_amnt)])
 
-    def add_monitored_topic(self, topic_name):
+    def add_monitored_topic(self, topic_name, plt_host):
         # Make first instance of the line so that we only have to update it later
-        line, = self.ax.plot(
+        line, = plt_host.plot(
             [], [], '-', color=self.colors[self.topic_count % len(self.colors)],
             marker=self.markers[self.topic_count % len(self.markers)], label=topic_name)
         self.reception_rate_plots[topic_name] = line
 
         # Update the plot legend to include the new line
-        self.ax.legend(
+        plt_host.legend(
             loc='upper center', bbox_to_anchor=(0.5, -0.1), fancybox=True, shadow=True, ncol=2)
 
         self.topic_count += 1
@@ -274,10 +291,12 @@ class TopicMonitorDisplay:
         now = time.time()
         now_relative = now - self.start_time
         self.x_data.append(now_relative)
+        max_latency = 0
         with self.topic_monitor.monitored_topics_lock:
             for topic_name, monitored_topic in self.topic_monitor.monitored_topics.items():
                 if topic_name not in self.monitored_topics:
-                    self.add_monitored_topic(topic_name)
+                    self.add_monitored_topic(topic_name, self.ax)
+                    self.add_monitored_topic(topic_name + "_latency", self.par1)
 
                 y_data = monitored_topic.reception_rate_over_time
                 line = self.reception_rate_plots[topic_name]
@@ -286,9 +305,20 @@ class TopicMonitorDisplay:
 
                 # Make the line slightly transparent if the topic is stale
                 line.set_alpha(0.5 if monitored_topic.status == 'Stale' else 1.0)
+                
+                y_data = monitored_topic.reception_latency_over_time
+                max_latency = max(max_latency, max(filter(None.__ne__, y_data)))
+                line = self.reception_rate_plots[topic_name + "_latency"]
+                line.set_ydata(y_data)
+                line.set_xdata(self.x_data[-len(y_data):])
+
+                # Make the line slightly transparent if the topic is stale
+                line.set_alpha(0.5 if monitored_topic.status == 'Stale' else 1.0)
 
         self.ax.axis(
             [now_relative - self.x_range_s, now_relative, 0, 1.1])
+        self.par1.axis(
+            [now_relative - self.x_range_s, now_relative, 0, max_latency * 1.25])
 
         self.fig.canvas.draw()
         plt.pause(0.0001)
@@ -427,7 +457,7 @@ def main():
                 topic_monitor.check_status()
                 topic_monitor.calculate_statistics()
                 if args.show_display:
-                    topic_monitor_display.update_display()
+                    topic_monitor_display.update_display()                
                 # sleep the main thread so background threads can do work
                 time_to_sleep = args.stats_calc_period - (time.time() - now)
                 if time_to_sleep > 0:
