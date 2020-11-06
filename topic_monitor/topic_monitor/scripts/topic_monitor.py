@@ -27,7 +27,7 @@ from rclpy.time import Time
 
 from std_msgs.msg import Float32, Header
 
-QOS_DEPTH = 10
+QOS_DEPTH = 100
 logger = rclpy.logging.get_logger('topic_monitor')
 
 
@@ -41,6 +41,7 @@ class MonitoredTopic:
         self.lock = lock or Lock()
         self.received_values = deque(maxlen=window_size)
         self.received_latencies = deque(maxlen=window_size)
+        self.window_size = window_size
         self.reception_rate_over_time = []
         self.reception_latency_over_time = []
         self.stale_time = stale_time
@@ -132,6 +133,7 @@ class TopicMonitor:
         self.monitored_topics_lock = Lock()
         self.publishers = {}
         self.reception_rate_topic_name = 'reception_rate'
+        self.reception_latency_topic_name = 'reception_latency'
         self.status_changed = False
         self.window_size = window_size
 
@@ -163,20 +165,26 @@ class TopicMonitor:
 
         # Create a publisher for the reception rate of the topic
         reception_rate_topic_name = self.reception_rate_topic_name + topic_name
+        reception_latency_topic_name = self.reception_latency_topic_name + topic_name
 
         # TODO(dhood): remove this workaround
         # once https://github.com/ros2/rmw_connext/issues/234 is resolved
         reception_rate_topic_name += '_'
+        reception_latency_topic_name += '_'
 
         node.get_logger().info(
             'Publishing reception rate on topic: %s' % reception_rate_topic_name)
+        node.get_logger().info(
+            'Publishing reception latency on topic: %s' % reception_latency_topic_name)
         reception_rate_publisher = node.create_publisher(
             Float32, reception_rate_topic_name, 10)
+        reception_latency_publisher = node.create_publisher(
+            Float32, reception_latency_topic_name, 10)
 
         with self.monitored_topics_lock:
             monitored_topic.expected_value_timer = expected_value_timer
             monitored_topic.allowed_latency_timer = allowed_latency_timer
-            self.publishers[topic_name] = reception_rate_publisher
+            self.publishers[topic_name] = (reception_rate_publisher, reception_latency_publisher)
             self.monitored_topics[topic_name] = monitored_topic
 
     def is_supported_type(self, type_name):
@@ -232,7 +240,11 @@ class TopicMonitor:
                 monitored_topic.reception_latency_over_time.append(latency)
                 rateMsg = Float32()
                 rateMsg.data = rate if rate is not None else 0.0
-                self.publishers[topic_id].publish(rateMsg)
+                latencyMsg = Float32()
+                latencyMsg.data = latency if latency is not None else 0.0
+                rate_pub, latency_pub = self.publishers[topic_id]
+                rate_pub.publish(rateMsg)
+                latency_pub.publish(latencyMsg)
 
     def get_window_size(self):
         return self.window_size
@@ -307,8 +319,8 @@ class TopicMonitorDisplay:
                 line.set_alpha(0.5 if monitored_topic.status == 'Stale' else 1.0)
                 
                 y_data = monitored_topic.reception_latency_over_time
-                if len(list(filter(None.__ne__, y_data))) > 0:
-                    max_latency = max(max_latency, max(filter(None.__ne__, y_data)))
+                if len(list(filter(None.__ne__, y_data))[-int(self.x_range_s):]) > 0:
+                    max_latency = max(max_latency, max(list(filter(None.__ne__, y_data))[-int(self.x_range_s):]))
                 line = self.reception_rate_plots[topic_name + "_latency"]
                 line.set_ydata(y_data)
                 line.set_xdata(self.x_data[-len(y_data):])

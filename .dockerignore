@@ -1,0 +1,10 @@
+.git/
+.gitignore
+.gitlab-ci.yml
+.cache/
+LICENSE
+Dockerfile
+*.md
+*.rst
+*.pdf
+docs/
